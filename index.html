@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gerador de poster A5 (DOI)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; max-width: 860px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; }
+    label { display: block; margin: 12px 0 6px; font-weight: 600; }
+    input, select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 10px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #333; background: #111; color: #fff; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .hint { color: #555; font-size: 14px; margin-top: 6px; }
+    .error { color: #b00020; font-weight: 600; }
+    .ok { color: #0a7; font-weight: 600; }
+    .small { font-size: 13px; color: #444; }
+  </style>
+
+  <!-- QRCode.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <!-- jsPDF -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+</head>
+
+<body>
+  <h1>Gerador de poster A5 (colar DOI → PDF com QR)</h1>
+
+  <div class="card">
+    <label for="doi">DOI</label>
+    <input id="doi" placeholder="ex: 10.1016/j.pec.2010.12.008" />
+
+    <div class="row">
+      <div>
+        <label for="venueOverride">Nome da revista/conferência (opcional)</label>
+        <input id="venueOverride" placeholder="ex: Patient Education and Counseling" />
+      </div>
+      <div>
+        <label for="yearOverride">Ano (opcional)</label>
+        <input id="yearOverride" placeholder="ex: 2025" />
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <label for="maxWords">Limite de palavras do abstract</label>
+        <select id="maxWords">
+          <option value="120">120</option>
+          <option value="150" selected>150</option>
+          <option value="180">180</option>
+          <option value="220">220</option>
+        </select>
+      </div>
+      <div>
+        <label for="qrLabel">Texto acima do QR</label>
+        <input id="qrLabel" value="Artigo completo:" />
+      </div>
+    </div>
+
+    <div style="margin-top: 14px; display:flex; gap: 10px; align-items:center;">
+      <button id="btn" onclick="run()" type="button">Gerar PDF A5 (paisagem)</button>
+      <span id="status" class="small"></span>
+    </div>
+
+    <p class="hint">
+      O QR aponta para <code>https://doi.org/&lt;DOI&gt;</code>.
+      O sistema tenta Crossref; se falhar, tenta OpenAlex.
+    </p>
+
+    <div id="err" class="error"></div>
+  </div>
+
+  <!-- área invisível para gerar o QR -->
+  <div id="qr" style="position:absolute; left:-9999px; top:-9999px;"></div>
+
+<script>
+  function setStatus(msg, cls="") {
+    const el = document.getElementById("status");
+    el.textContent = msg || "";
+    el.className = "small " + (cls || "");
+  }
+  function setError(msg) {
+    document.getElementById("err").textContent = msg || "";
+  }
+
+  function normalizeDoi(raw) {
+    let doi = (raw || "").trim();
+    doi = doi.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "");
+    doi = doi.replace(/^doi:\s*/i, "");
+    return doi.trim();
+  }
+
+  function stripHtml(s) {
+    const d = document.createElement("div");
+    d.innerHTML = s || "";
+    return (d.textContent || d.innerText || "").trim();
+  }
+
+  function truncateWords(text, maxWords) {
+    const words = (text || "").trim().split(/\s+/).filter(Boolean);
+    if (words.length <= maxWords) return text.trim();
+    return words.slice(0, maxWords).join(" ") + "…";
+  }
+
+  async function fetchCrossref(doi) {
+    const url = `https://api.crossref.org/works/${encodeURIComponent(doi)}`;
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) throw new Error("Crossref não encontrou (ou bloqueou) este DOI.");
+    const data = await r.json();
+    const m = data.message || {};
+
+    const title = (m.title && m.title[0]) ? m.title[0] : "";
+    const authors = (m.author || []).map(a => {
+      const given = a.given || "";
+      const family = a.family || "";
+      return (given + " " + family).trim();
+    }).filter(Boolean);
+
+    const venue = (m["container-title"] && m["container-title"][0]) ? m["container-title"][0] : "";
+    const year = (m.issued && m.issued["date-parts"] && m.issued["date-parts"][0] && m.issued["date-parts"][0][0])
+      ? String(m.issued["date-parts"][0][0])
+      : "";
+
+    const abstract = m.abstract ? stripHtml(m.abstract) : "";
+
+    return { title, authors, venue, year, abstract, source: "Crossref" };
+  }
+
+  async function fetchOpenAlex(doi) {
+    const url = `https://api.openalex.org/works?filter=doi:https://doi.org/${encodeURIComponent(doi)}`;
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) throw new Error("OpenAlex não respondeu.");
+    const data = await r.json();
+    const w = (data.results && data.results[0]) ? data.results[0] : null;
+    if (!w) throw new Error("OpenAlex não encontrou este DOI.");
+
+    const title = w.title || "";
+    const authors = (w.authorships || []).map(a => a.author?.display_name).filter(Boolean);
+    const venue = w.primary_location?.source?.display_name || "";
+    const year = w.publication_year ? String(w.publication_year) : "";
+
+    let abstract = "";
+    if (w.abstract_inverted_index) {
+      const idx = w.abstract_inverted_index;
+      const words = [];
+      for (const [word, positions] of Object.entries(idx)) {
+        positions.forEach(pos => { words[pos] = word; });
+      }
+      abstract = words.filter(Boolean).join(" ");
+    }
+
+    return { title, authors, venue, year, abstract, source: "OpenAlex" };
+  }
+
+  function makeQrDataUrl(text, sizePx=320) {
+    const container = document.getElementById("qr");
+    container.innerHTML = "";
+    new QRCode(container, {
+      text,
+      width: sizePx,
+      height: sizePx,
+      correctLevel: QRCode.CorrectLevel.M
+    });
+    const canvas = container.querySelector("canvas");
+    if (!canvas) throw new Error("Falha ao gerar QR (canvas não criado).");
+    return canvas.toDataURL("image/png");
+  }
+
+  async function run() {
+    setError("");
+    const btn = document.getElementById("btn");
+    btn.disabled = true;
+
+    try {
+      const doi = normalizeDoi(document.getElementById("doi").value);
+      if (!doi) throw new Error("Cola um DOI válido (ex: 10.xxxx/xxxxx).");
+
+      setStatus("A obter metadados…");
+      let meta;
+      try { meta = await fetchCrossref(doi); }
+      catch { meta = await fetchOpenAlex(doi); }
+
+      const maxWords = parseInt(document.getElementById("maxWords").value, 10) || 150;
+
+      const title = meta.title || "(sem título disponível)";
+      const authors = (meta.authors && meta.authors.length) ? meta.authors.join(", ") : "(autores indisponíveis)";
+
+      // Permitir override manual (para ficares igual ao exemplo)
+      const venueOverride = (document.getElementById("venueOverride").value || "").trim();
+      const yearOverride  = (document.getElementById("yearOverride").value || "").trim();
+      const venue = venueOverride || meta.venue || "";
+      const year  = yearOverride  || meta.year  || "";
+
+      const abstractRaw = meta.abstract ? meta.abstract : "(abstract indisponível via metadados)";
+      const abstract = truncateWords(abstractRaw, maxWords);
+
+      const doiUrl = `https://doi.org/${doi}`;
+      setStatus("A gerar QR code…");
+      const qrPng = makeQrDataUrl(doiUrl, 360);
+
+      setStatus("A criar PDF A5…");
+      const { jsPDF } = window.jspdf;
+
+      // A5 paisagem: 210 x 148 mm
+      const doc = new jsPDF({ orientation: "landscape", unit: "mm", format: "a5" });
+
+      const pageW = doc.internal.pageSize.getWidth();   // ~210
+      const pageH = doc.internal.pageSize.getHeight();  // ~148
+      const margin = 12;
+
+      // Colunas (como na imagem)
+      const rightColW = 62;     // coluna do QR
+      const gap = 8;
+      const leftColW = pageW - margin*2 - gap - rightColW;
+
+      const leftX = margin;
+      const rightX = margin + leftColW + gap;
+
+      // Linha do topo: venue à esquerda (itálico) e ano à direita
+      const topY = 12;
+      doc.setFont("helvetica", "italic");
+      doc.setFontSize(9);
+      if (venue) doc.text(venue, leftX, topY);
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(9);
+      if (year) doc.text(year, pageW - margin, topY, { align: "right" });
+
+      // Título grande
+      let y = 24;
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(16);
+      const titleLines = doc.splitTextToSize(title, leftColW);
+      doc.text(titleLines, leftX, y);
+      y += titleLines.length * 6.2 + 4;
+
+      // Autores
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      const authorLines = doc.splitTextToSize(authors, leftColW);
+      doc.text(authorLines, leftX, y);
+      y += authorLines.length * 4.6 + 6;
+
+      // Abstract (corpo)
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9.5);
+      const absLines = doc.splitTextToSize(abstract, leftColW);
+      doc.text(absLines, leftX, y);
+
+      // Bloco da direita: "Artigo completo:" + QR + link
+      const qrLabel = (document.getElementById("qrLabel").value || "Artigo completo:").trim();
+      let ry = 56; // posição visual semelhante ao exemplo
+
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.text(qrLabel, rightX, ry);
+      ry += 6;
+
+      const qrSize = 48; // ~4.8cm
+      doc.addImage(qrPng, "PNG", rightX, ry, qrSize, qrSize);
+      ry += qrSize + 8;
+
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(8.5);
+
+      // link em 2 linhas se necessário (como no exemplo)
+      const linkLines = doc.splitTextToSize(doiUrl, rightColW);
+      doc.text(linkLines, rightX, ry);
+
+      doc.save(`poster_A5_${doi.replace(/\//g, "_")}.pdf`);
+      setStatus(`Feito (metadados: ${meta.source}).`, "ok");
+
+    } catch (e) {
+      setError(e.message || String(e));
+      setStatus("Falhou.", "error");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+</script>
+</body>
+</html>
